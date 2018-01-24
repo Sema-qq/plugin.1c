@@ -1,22 +1,55 @@
-<?php  
+<?php
+
+use application\models\Fias\FiasAddrObjNew;
+use application\models\Fias\FiasSocrBaseNew;
+
+/**
+ * Class FiasCommand
+ * Скачиваем базу Фиас (архив 5-6гб)
+ * распарсиваем её (конкретно файл AS_ADDROBJ...) и заносим  в бд.
+ * (в будущем планируется распарсить и файл AS_SOCRBASE..)
+ * запуск комманды: ./yiic fias --addrobj
+ * параметрами передаются файлы, которые нужно распарсить
+ * когда понадобиться парсить второй файл, запускать ./yiic fias --addrobj --socrbase
+ * Если хоть где то ошибка, нужно всё остановить! (т.к. нужны полные актуальные данные)
+ * 'http://fias.nalog.ru/Public/Downloads/Actual/fias_xml.rar' ссылка на актуальную базу
+ */
+class FiasCommand extends CConsoleCommand
+{
+    /**
+     * Имя, которое мы присвоим скачанному архиву
+     */
+    const RARNAME = 'fias_xml.rar';
+
 
     /**
-     *Запускаем скачивание файла, затем парсеры, а в конце всё удаляем
+     * Перед запуском файла очистим таблицу и удалим предыдущий архив
+     * Запускаем скачивание файла, затем парсеры
+     * Если всё успешно, то удалим файлы, которые распарсили
+     * @param bool $addrobj
+     * @param bool $socrbase
      */
-    public function actionIndex()
+    public function actionIndex($addrobj = false, $socrbase = false)
     {
+        //предварительно очищаем таблицу (на truncate нету прав у user_noc)
+        Yii::app()->db->createCommand('DELETE A_DBA.FIAS_ADDROBJ_NEW')->execute();
+        //прошлый архив удаляем перед скачиванием нового архива.
+        if (file_exists(Yii::app()->params['uploadDir'] . self::RARNAME)) {
+            unlink(Yii::app()->params['uploadDir'] . self::RARNAME);
+        }
         if ($this->download()) {
-            $files = $this->getFilename();
-            if (!empty($files)) {
-                if ($this->parse($files['AS_ADDROBJ'], 'Object', 'FiasAddrObjNew')) {
-                    unlink($files['AS_ADDROBJ']);
+            if ($files = $this->getFilename($addrobj, $socrbase)){
+                if (!empty($files['AS_ADDROBJ']) && file_exists($files['AS_ADDROBJ'])) {
+                    if ($this->parse($files['AS_ADDROBJ'], 'Object', '\application\models\Fias\FiasAddrObjNew')) {
+                        unlink($files['AS_ADDROBJ']);
+                    }
                 }
-//                раскомментировать условие ниже, когда понадобиться парсисть второй файл
-//                if ($this->parse($files['AS_SOCRBASE'], 'AddressObjectType', 'FiasSocrBaseNew')) {
-//                    unlink($files['AS_SOCRBASE']);
-//                }
+                if (!empty($files['AS_SOCRBASE']) && file_exists($files['AS_SOCRBASE'])) {
+                    if ($this->parse($files['AS_SOCRBASE'], 'AddressObjectType', '\application\models\Fias\FiasSocrBaseNew')) {
+                        unlink($files['AS_SOCRBASE']);
+                    }
+                }
             }
-            unlink(self::DIR . self::RARNAME);
         }
     }
 
@@ -27,8 +60,8 @@
     private function download()
     {
         try {
-            $ch = curl_init(self::URL);
-            $fp = fopen(self::DIR . self::RARNAME, 'w');
+            $ch = curl_init(Yii::app()->params['fiasDownloadUrl']);
+            $fp = fopen(Yii::app()->params['uploadDir'] . self::RARNAME, 'w');
             curl_setopt($ch, CURLOPT_FILE, $fp);
             curl_setopt($ch, CURLOPT_HEADER, 0);
             curl_exec($ch);
@@ -42,29 +75,40 @@
     }
 
     /**
-     * Разбираем архив, берем только нужные файлы, остальные удаляем.
-     * @return mixed
+     * Разбираем архив, берем только нужные файлы.
+     * @param bool $addrobj
+     * @param bool $socrbase
+     * @return array|bool
      */
-    private function getFilename()
+    private function getFilename($addrobj, $socrbase)
     {
-        $rar = RarArchive::open(self::DIR . self::RARNAME);
-        foreach ($rar->getEntries() as $entry) {
-            if (strripos($entry->getName(), 'AS_ADDROBJ') !== false) {
-                $files['AS_ADDROBJ'] = $entry->getName();
-                $entry->extract(self::DIR);
-            } elseif (strripos($entry->getName(), 'AS_SOCRBASE') !== false) {
-                $files['AS_SOCRBASE'] = $entry->getName();
-                $entry->extract(self::DIR);
+        try {
+            $rar = RarArchive::open(Yii::app()->params['uploadDir'] . self::RARNAME);
+            $files = [
+                'AS_ADDROBJ' => '',
+                'AS_SOCRBASE' => ''
+            ];
+            foreach ($rar->getEntries() as $entry) {
+                if ((strripos($entry->getName(), 'AS_ADDROBJ') !== false) && (!empty($addrobj))) {
+                    $files['AS_ADDROBJ'] = Yii::app()->params['uploadDir'] . $entry->getName();
+                    $entry->extract(Yii::app()->params['uploadDir']);
+                } elseif ((strripos($entry->getName(), 'AS_SOCRBASE') !== false) && (!empty($socrbase))) {
+                    $files['AS_SOCRBASE'] = Yii::app()->params['uploadDir'] . $entry->getName();
+                    $entry->extract(Yii::app()->params['uploadDir']);
+                }
             }
+            return $files;
+        } catch (Exception $e) {
+            Yii::log('Ошибка при распаковке архива: ' . $e->getMessage(), CLogger::LEVEL_ERROR, 'Fias');
+            return false;
         }
-        return !empty($files) ?: null;
     }
 
     /**
      * Распарсиваем файл по строчно, т.к. вес от 2.5гб
-     * @param $file
-     * @param $readerName
-     * @param $modelName
+     * @param string $file
+     * @param string $readerName
+     * @param string $modelName
      * @return bool
      */
     private function parse($file, $readerName, $modelName)
@@ -94,12 +138,7 @@
                             }
                         }
                     }
-                    try {
-                        $this->insert($data, $modelName);
-                    } catch (Exception $e) {
-                        Yii::log('Ошибка при занесении в базу: ' . $e->getMessage(), CLogger::LEVEL_ERROR, 'Fias');
-                        return false;
-                    }
+                    $this->insert($data, $modelName);
                 }
             }
         } catch (Exception $e) {
@@ -111,28 +150,24 @@
 
     /**
      * Сохраняем в базу
-     * @param $data
-     * @param $modelName
+     * @param array $data
+     * @param string $modelName
      * @return bool
      */
     public function insert($data, $modelName)
     {
-        if ($modelName == 'FiasAddrObjNew') {
-            $model = new FiasAddrObjNew();
-        } elseif ($modelName == 'FiasSocrBaseNew') {
-            $model =new FiasSocrBaseNew();
-        }
+        $model = new $modelName();
         $model->unsetAttributes();
         return $model->load($data, '') && $model->save();
     }
 
     /**
      * Из строки получаем только нужное нам название атрибута
-     * @param $value
+     * @param string $value
      * @return mixed
      */
     private function getAttr($value)
     {
         return str_replace('=', '', substr($value, 0, strpos($value, '=')));
     }
-?>
+}
